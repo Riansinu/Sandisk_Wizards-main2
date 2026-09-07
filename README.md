@@ -1,6 +1,15 @@
 # WaferFusion-Cascade: SanDisk Die Yield Prediction System
 
-WaferFusion-Cascade is a multi-resolution, uncertainty-aware ML system designed for the SanDisk Die Yield Hackathon. It implements a two-stage screening cascade that evaluates die-level parametric signatures, wafer-level spatial geometry, and deep sub-die 2,000-block electrical waveforms while ensuring strict data-leakage boundaries and compute efficiency.
+WaferFusion-Cascade is a multi-resolution ML system for the SanDisk Die Yield
+Hackathon. Model A screens die-level parametric and wafer-spatial context with
+LightGBM; Model B adds a PyTorch CNN over 2,000 block readings. Evaluation uses
+five-fold wafer-grouped out-of-fold (OOF) predictions with preprocessing fitted
+inside each fold.
+
+The final saved operating policy is the single-model CNN cascade with a
+cost-weighted 8:1 false-negative/false-positive ratio. The test-set result is a
+confirmatory check, not a fully untouched final evaluation, because candidate
+cost ratios were inspected on that test set. See `outputs/reports/final_report.md`.
 
 ---
 
@@ -15,9 +24,7 @@ Feature Engineering (500+ parametric, multi-scale spatial 3x3/5x5/7x7, local z-s
    ↓
 Model A: Fast Screening (LightGBM with XGBoost/HistGBM fallbacks)
    ↓
-Probability Calibration (Isotonic Regression on holdout wafers)
-   ↓
-Uncertainty / Conformal Gate (Coverage-controlled prediction sets)
+OOF-derived uncertainty gate (routing heuristic; no coverage guarantee)
    ↓
 Cascade Safety Router
    ├── Confident → Pure Model A resolution (Fast)
@@ -27,10 +34,15 @@ Cascade Safety Router
                                                   ↓
                                        Evidence Fusion (Modal Gating)
                                                   ↓
-                                        Final Calibrated Risk
+                                        Final uncalibrated risk score
                                                   ↓
                                        Submission & Visualizations
 ```
+
+The current saved calibrators are intentionally identity transforms so OOF
+thresholds and inference scores remain on the same scale. The routing gate is a
+heuristic built from OOF scores; this project does not claim split-conformal
+coverage or calibrated probabilities.
 
 ---
 
@@ -104,30 +116,95 @@ sandisk_die_yield/
     └── test_validator.py      # Multi-level data validator tests
 ```
 
+### Package-layout note
+
+The active pipeline imports from `src/sandisk_yield/`. The smaller top-level
+`src/data/` and `src/features/` packages are retained only because legacy schema
+and validator tests import them. Top-level `src/models/` and `src/evaluation/`
+are compatibility package markers; new application code should not import them.
+
 ---
 
-## 3. How to Run
+## 3. Setup and judge walkthrough
 
-### Step 1: Run Full Pytest Test Suite
-```bash
-pytest tests -v
+From PowerShell on Windows:
+
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python -m pip install -e . --no-deps --no-build-isolation
 ```
 
-### Step 2: Run Full End-to-End Pipeline
-```bash
-# Fast mode for rapid validation:
-python scripts/run_all.py --fast
+Place the confidential files at exactly:
 
-# Full production run:
-python scripts/run_all.py --config configs/base.yaml
+```text
+input/train.csv
+input/validation.csv
+input/test.csv
 ```
 
-### Step 3: Run Interactive Streamlit Dashboard
-```bash
-streamlit run dashboard/app.py
+They are ignored by Git. Model binaries and row-level prediction exports are
+also intentionally excluded. A fresh clone therefore needs locally supplied
+data and either the separately supplied frozen model artifacts or a deliberate
+training run.
+
+### Step 1: Run the offline test suite
+
+```powershell
+python -m pytest tests -v
 ```
 
-### Step 4: Run Inference on New Unlabeled Datasets
-```bash
-python scripts/predict.py --input input/validation.csv --output outputs/predictions/submission.csv
+### Step 2: Reproduce reports from existing frozen artifacts—no retraining
+
+```powershell
+python scripts/run_all.py --postprocess-only --threshold-objective cost_weighted --fn-fp-cost-ratio 8 --ensemble-mode none
+python scripts/analyze_thresholds.py --test-labels input/test.csv --ratios 4 8 12
+python scripts/generate_analysis_deliverables.py
 ```
+
+The first two commands use saved OOF/test scores. The third performs feature
+transformation and explanation with frozen models; it verifies model hashes did
+not change. None of these commands fits a model or changes the submission.
+
+### Step 3: Open the dashboard
+
+```powershell
+python -m streamlit run dashboard/app.py
+```
+
+Open `http://localhost:8501`. The judge-facing tabs include Benchmark
+Comparison, Interpretability, and Imbalance Analysis.
+
+### Optional: deliberately train the full pipeline
+
+This is slow and replaces local model/output artifacts:
+
+```powershell
+python scripts/run_all.py --config configs/base.yaml --block-mode cnn --compare-block-modes
+```
+
+Do not run this merely to view the existing evidence.
+
+### Recreate the final Cost 8:1 submission from saved probabilities
+
+```powershell
+python scripts/predict.py --from-probabilities outputs/predictions/prediction_probabilities.csv --threshold-objective cost_weighted --fn-fp-cost-ratio 8 --ensemble-mode none --output outputs/predictions/submission.csv
+```
+
+This command re-thresholds saved scores without model inference. The general CLI
+default remains F1, so keep the explicit Cost 8:1 flags for the selected policy.
+
+## 4. Current evidence
+
+- `outputs/metrics/operating_point_comparison.csv`: Model A/Model B OOF metrics.
+- `outputs/reports/final_report.md`: exact final submission metrics and caveat.
+- `outputs/reports/model_a_per_die_shap.csv`: current per-die TreeSHAP evidence.
+- `outputs/reports/model_a_spatial_contribution.png`: spatial SHAP map.
+- `outputs/reports/model_b_block_pattern_analysis_current.csv`: CNN attention regions.
+- `outputs/reports/imbalance_analysis/summary.md`: imbalance and overlap interpretation.
+
+CNN attention is supporting evidence about regions emphasized by the encoder;
+it is not presented as a causal explanation. TreeSHAP values are LightGBM
+log-odds contributions.
